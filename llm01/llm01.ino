@@ -4,49 +4,163 @@
   Licença: MIT (este ficheiro). Tabelas e ideias de temporização conforme créditos abaixo.
 
   Créditos e fontes:
-  - Temporização ADB e formato de bit (bit cell 100 µs; “1” = 35 µs LOW + 65 µs HIGH, “0” = 65 µs LOW + 35 µs HIGH): 
-    Microchip App Note AN591B "Apple Desktop Bus (ADB)" (trechos temporais). 
+  - Temporização ADB e formato de bit (bit cell 100 µs; “1” = 35 µs LOW + 65 µs HIGH, “0” = 65 µs LOW + 35 µs HIGH):
+    Microchip App Note AN591B "Apple Desktop Bus (ADB)" (trechos temporais).
   - Resumo de temporização e introdução: “ADB: An Introduction” por Mateusz Łopaciuk.
   - Formato de pacotes de rato ADB (Handler 1/2 e 4), bits de botões e deltas de 7 bits: código-fonte do driver Linux adbmouse.c.
   - Endereço padrão do rato ($3), Handler ID $01, 2 bytes de movimento: RetroTechCollection wiki.
-  - Mapeamento de keycodes ADB clássicos (baseados em tabelas comuns de keycodes do Mac): lista “Mac virtual keycodes” (A=0x00, S=0x01, ...). 
+  - Mapeamento de keycodes ADB clássicos (baseados em tabelas comuns de keycodes do Mac): lista “Mac virtual keycodes” (A=0x00, S=0x01, ...).
   - PS/2 scan set 2: tabelas públicas (ex.: OSDev wiki e tabelas de scan codes set 2).
 
   Ver secção “Referências” no final para ligações.
 */
 
-#define SERIAL_LOG 1
-// ----------------------------- Configuração de pinos -----------------------------
-const uint8_t PS2K_CLK = 3;   // Teclado PS/2 CLK
-const uint8_t PS2K_DAT = 2;   // Teclado PS/2 DATA
-const uint8_t PS2M_CLK = 7;   // Rato PS/2 CLK
-const uint8_t PS2M_DAT = 6;   // Rato PS/2 DATA
-const uint8_t ADB_PIN  = 12;   // Linha ADB (open-collector via transistor)
-const uint8_t LED_PIN  = 13;
+#include <Arduino.h>
+#ifdef ARDUINO_ARCH_AVR
+  #include <util/delay.h>
+  #include <avr/pgmspace.h>
+#else
+  #define _delay_us(x) delayMicroseconds((unsigned int)(x))
+  #ifndef PROGMEM
+    #define PROGMEM
+  #endif
+#endif
 
-// ----------------------------- Parâmetros ADB -----------------------------
-// Bit cell ≈ 100 µs. “1”: 35 µs LOW + 65 µs HIGH. “0”: 65 µs LOW + 35 µs HIGH.
-// Tolerâncias: host ±3%, device ±30% (conforme AN591B). Ajustável conforme máquina.
-/*
-const uint16_t ADB_T_LOW_1_US = 35;
-const uint16_t ADB_T_HIGH_1_US = 65;
-const uint16_t ADB_T_LOW_0_US = 65;
-const uint16_t ADB_T_HIGH_0_US = 35;
-// Timings de enquadramento
-const uint16_t ADB_T_START_US = 800;   // pulso de atenção/attn detetado do host (~0,8–1 ms típico)
-const uint16_t ADB_T_SYNC_US  = 200;   // margem entre bits/stop (ajuste fino se necessário)
+#include "config.h"
 
-*/
-// Conservador
-const uint16_t ADB_T_LOW_1_US=40, ADB_T_HIGH_1_US=60;
-const uint16_t ADB_T_LOW_0_US=66, ADB_T_HIGH_0_US=34;
-const uint16_t ADB_T_START_US=900, ADB_T_SYNC_US=200;
+// ----------------------------- ADB baixo nível (portado de adbduino) -----------------------------
+// Vamos usar registos AVR diretamente para precisão de timings (como em adbduino), mas com o pino D12.
+// Em Arduino Uno/Nano, D12 é PB4.
+#ifdef ARDUINO_ARCH_AVR
+  #define ADB_PORT        PORTB
+  #define ADB_PINREG      PINB
+  #define ADB_DDR         DDRB
+  #define ADB_DATA_BIT    PB4
+  // Controlos de linha (open-collector: saída a LOW para puxar; entrada para libertar)
+  #define data_lo() { (ADB_DDR |=  (1<<ADB_DATA_BIT)); (ADB_PORT &= ~(1<<ADB_DATA_BIT)); }
+  #define data_hi() (ADB_DDR &= ~(1<<ADB_DATA_BIT))
+  #define data_in() (ADB_PINREG &   (1<<ADB_DATA_BIT))
+#else
+  // Fallback genérico (menos preciso) para não-AVR: usa pinMode/digitalWrite
+  #define data_lo() { pinMode(ADB_PIN, OUTPUT); digitalWrite(ADB_PIN, LOW); }
+  #define data_hi() { pinMode(ADB_PIN, INPUT_PULLUP); }
+  #define data_in() (digitalRead(ADB_PIN))
+#endif
+
+static inline uint16_t wait_data_lo(uint16_t us)
+{
+  do {
+    if ( !data_in() )
+      break;
+    _delay_us(1 - (6 * 1000000.0 / F_CPU));
+  }
+  while ( --us );
+  return us;
+}
+static inline uint16_t wait_data_hi(uint16_t us)
+{
+  do {
+    if ( data_in() )
+      break;
+    _delay_us(1 - (6 * 1000000.0 / F_CPU));
+  }
+  while ( --us );
+  return us;
+}
+
+static inline void place_bit0(void)
+{
+  data_lo();
+  _delay_us(65);
+  data_hi();
+  _delay_us(35);
+}
+static inline void place_bit1(void)
+{
+  data_lo();
+  _delay_us(35);
+  data_hi();
+  _delay_us(65);
+}
+static inline void send_byte(uint8_t data)
+{
+  for (int i = 0; i < 8; i++) {
+    if (data & (0x80 >> i))
+      place_bit1();
+    else
+      place_bit0();
+  }
+}
+static uint8_t inline adb_recv_cmd(uint8_t srq)
+{
+  uint8_t bits;
+  uint16_t data = 0;
+
+  // detetar attention & start bit do host
+  if (!wait_data_lo(5000)) return 0;
+  uint16_t lowtime = wait_data_hi(1000);
+  if (!lowtime || lowtime > 500) {
+    return 0;
+  }
+  wait_data_lo(100);
+
+  for (bits = 0; bits < 8; bits++) {
+    uint8_t lo = wait_data_hi(130);
+    if (!lo) {
+      goto out;
+    }
+    uint8_t hi = wait_data_lo(lo);
+    if (!hi) {
+      goto out;
+    }
+    hi = lo - hi;
+    lo = 130 - lo;
+
+    data <<= 1;
+    if (lo < hi) {
+      data |= 1;
+    }
+  }
+
+  if (srq) {
+    data_lo();
+    _delay_us(250);
+    data_hi();
+  } else {
+    // Stop bit normal low time é ~70us + pode ter SRQ de ~300us
+    wait_data_hi(400);
+  }
+
+  return data;
+out:
+  return 0;
+}
+
+// Recebe um byte de dados ADB do host (após um comando Listen), usando o mesmo medidor de duty-cycle
+static bool inline adb_recv_data_byte(uint8_t &out)
+{
+  uint8_t bits;
+  uint16_t data = 0;
+
+  for (bits = 0; bits < 8; bits++) {
+    uint8_t lo = wait_data_hi(130);
+    if (!lo) return false;
+    uint8_t hi = wait_data_lo(lo);
+    if (!hi) return false;
+    hi = lo - hi;
+    lo = 130 - lo;
+    data <<= 1;
+    if (lo < hi) data |= 1;
+  }
+  // Stop bit do host
+  wait_data_hi(400);
+  out = (uint8_t)data;
+  return true;
+}
 
 
 
-// Endereços ADB dos dispositivos que vamos emular
-const uint8_t ADB_ADDR_KBD = 2;  // teclado
-const uint8_t ADB_ADDR_MSE = 3;  // rato
+// Endereços ADB dos dispositivos que vamos emular (parametrizáveis)
 
 // ----------------------------- Buffers e estado -----------------------------
 // Buffer simples de eventos do teclado: até 8 transições pendentes
@@ -61,89 +175,33 @@ volatile uint8_t kbd_leds = 0; // bits 0..2 para LEDs (caps/num/scroll no ADB ex
 volatile int16_t mouse_dx = 0, mouse_dy = 0;
 volatile uint8_t mouse_buttons = 0; // bit2=left, bit1=middle, bit0=right (convenção interna)
 
-// ----------------------------- Utilitários GPIO ADB -----------------------------
-inline void adb_line_low()   { pinMode(ADB_PIN, OUTPUT); digitalWrite(ADB_PIN, LOW); }
-inline void adb_line_release(){ pinMode(ADB_PIN, INPUT_PULLUP); /* pull-up externo mantém HIGH */ }
-inline uint8_t adb_line_read(){ return digitalRead(ADB_PIN); }
+// Estado ADB (portado de adbduino)
+uint8_t kbdsrq       = 0;
+uint8_t kbdpending   = 0;
+uint16_t kbdprev0    = 0;
+uint16_t mousereg0   = 0;
+uint16_t kbdreg0     = 0;
+uint32_t kbskiptimer = 0;
+uint8_t kbdskip      = 0;
+uint8_t modifierkeys = 0xFF;
+uint8_t mousesrq     = 0;
+uint8_t mousepending = 0;
 
-// Bitbang de um bit ADB (lado device)
-void adb_write_bit(uint8_t bit1) {
-  noInterrupts();
-  if (bit1) { adb_line_low(); delayMicroseconds(35); adb_line_release(); delayMicroseconds(65); }
-  else      { adb_line_low(); delayMicroseconds(65); adb_line_release(); delayMicroseconds(35); }
-  interrupts();
-}
-
-// Envio de um byte ADB (MSB primeiro), inclui stop bit
-void adb_write_byte(uint8_t b) {
-  for (int i = 7; i >= 0; --i) {
-    adb_write_bit((b >> i) & 1);
-  }
-  // Stop bit: “1”
-  adb_write_bit(1);
-}
-
-// Envio de pacote de N bytes
-void adb_write_packet(const uint8_t* data, uint8_t len) {
-  noInterrupts();
-  for (uint8_t i = 0; i < len; ++i) {
-    for (int b = 7; b >= 0; --b) adb_write_bit((data[i] >> b) & 1);
-    adb_write_bit(1); // stop
-  }
-  interrupts();
-}
-
-// Leitura de um byte do host (MSB primeiro). Muito simplificado: assume janela correta após ATTENTION.
-uint8_t adb_read_byte_blocking() {
-  uint8_t v = 0;
-  for (int i = 7; i >= 0; --i) {
-    // O host gera os níveis. Amostramos ao meio do bit cell.
-    delayMicroseconds(50); // ~meio da célula de 100us
-    uint8_t level = adb_line_read(); // 1=HIGH, 0=LOW
-    // Interpretação simplista: HIGH predominante aproxima “1” (porque “1” tem 65us HIGH)
-    // Aqui só usamos como relógio grosseiro. Em prática, deverias medir low vs high.
-    // Para simplificar usamos transição média:
-    v |= (level ? 1 : 0) << i;
-    delayMicroseconds(50);
-  }
-  // Stop bit do host
-  delayMicroseconds(100);
-  return v;
-}
-
-// Aguarda pulso de atenção do host (queda longa da linha), retorna true se detetado
-bool adb_wait_attention(uint32_t timeout_ms=50) {
-  uint32_t t0 = millis();
-  // Espera por LOW sustentado
-  while (millis() - t0 < timeout_ms) {
-    if (adb_line_read() == LOW) {
-      // confirma que durou o suficiente
-      delayMicroseconds(ADB_T_START_US);
-      if (adb_line_read() == LOW) {
-        // libertação
-        while (adb_line_read() == LOW) { /* aguarda */ }
-        delayMicroseconds(ADB_T_SYNC_US);
-        return true;
-      }
-    }
-  }
-  return false;
-}
+// ----------------------------- Utilitários (removidos os antigos de ADB bitbang — agora usamos os de cima) -----------------------------
 
 // ----------------------------- PS/2 baixo nível (polling simples) -----------------------------
 // PS/2: clock gerido pelo device. Amostramos na borda descendente.
 // Implementação mínima, robusta para make/break e e0 prefixado.
 bool ps2_read_byte(uint8_t clk, uint8_t dat, uint8_t &out) {
-  // Espera start bit (DATA=LOW quando CLOCK desce)
-  // Timeout simples
-  uint32_t t0 = millis();
-  while (digitalRead(clk) == HIGH) { if (millis() - t0 > 50) return false; }
+  // Versão não-bloqueante: se clock está HIGH, não há byte a iniciar
+  if (digitalRead(clk) == HIGH) return false;
   // 11 bits: start(0), 8 dados LSB->MSB, paridade, stop(1)
   uint8_t data = 0;
   // Sincroniza nas 8 quedas seguintes
   for (int i = 0; i < 11; ++i) {
     // Espera queda
-    while (digitalRead(clk) == HIGH) { if (millis() - t0 > 50) return false; }
+    uint32_t t0 = micros();
+    while (digitalRead(clk) == HIGH) { if ((micros() - t0) > 2000) return false; }
     delayMicroseconds(5); // pequena margem
     uint8_t bit = digitalRead(dat);
     if (i >= 1 && i <= 8) { // bits de dados
@@ -151,14 +209,15 @@ bool ps2_read_byte(uint8_t clk, uint8_t dat, uint8_t &out) {
       if (bit) data |= 0x80;
     }
     // Espera subida
-    while (digitalRead(clk) == LOW) { if (millis() - t0 > 50) return false; }
+    t0 = micros();
+    while (digitalRead(clk) == LOW) { if ((micros() - t0) > 2000) return false; }
   }
   out = data;
   return true;
 }
 
 // Leitura de um “scancode” completo (com prefixos), devolve código lógico:
-// Retorna 0xF0 como “break”, 0xE0 como “extended”, ou byte normal. 
+// Retorna 0xF0 como “break”, 0xE0 como “extended”, ou byte normal.
 bool ps2_next_code(uint8_t clk, uint8_t dat, uint8_t &code) {
   uint8_t b;
   if (!ps2_read_byte(clk, dat, b)) return false;
@@ -289,9 +348,10 @@ void poll_ps2_keyboard() {
   static bool break_next = false;
   static bool ext = false;
 
-  while (ps2_next_code(PS2K_CLK, PS2K_DAT, code)) {
-    if (code == 0xF0) { break_next = true; continue; }
-    if (code == 0xE0) { ext = true; continue; }
+  // Lê no máximo um código por chamada para evitar bloqueios
+  if (ps2_next_code(PS2K_CLK, PS2K_DAT, code)) {
+    if (code == 0xF0) { break_next = true; return; }
+    if (code == 0xE0) { ext = true; return; }
 
     int8_t adb = -1;
     if (ext) adb = ps2e0_to_adb(code);
@@ -324,138 +384,205 @@ void poll_ps2_keyboard() {
 
 // ----------------------------- PS/2 Rato → ADB -----------------------------
 // Leitura de pacotes PS/2 (3 bytes): [buttons | dx | dy], com sinais e overflow nos bits altos.
-bool ps2_mouse_packet(int8_t &dx, int8_t &dy, uint8_t &btn) {
-  uint8_t b0, b1, b2;
+bool ps2_mouse_packet_raw(uint8_t &b0, uint8_t &b1, uint8_t &b2) {
   if (!ps2_read_byte(PS2M_CLK, PS2M_DAT, b0)) return false;
   if (!ps2_read_byte(PS2M_CLK, PS2M_DAT, b1)) return false;
   if (!ps2_read_byte(PS2M_CLK, PS2M_DAT, b2)) return false;
-  // PS/2: b0 bits: 0: left, 1: right, 2: middle, 4: sx, 5: sy
-  int8_t dxs = (int8_t)((b0 & 0x10) ? (b1 | 0xFFFFFF00) : b1);
-  int8_t dys = (int8_t)((b0 & 0x20) ? (b2 | 0xFFFFFF00) : b2);
-  dx = dxs; dy = dys;
-  btn = 0;
-  if (b0 & 0x01) btn |= 0x04; // left -> bit2
-  if (b0 & 0x04) btn |= 0x02; // middle -> bit1
-  if (b0 & 0x02) btn |= 0x01; // right -> bit0
   return true;
 }
 
 void poll_ps2_mouse() {
-  int8_t dx, dy; uint8_t b;
-  // Poll muito simples: tenta ler “window” de 3 bytes se o clock baixar
+  // Poll muito simples: tenta ler um pacote se o clock baixar
   if (digitalRead(PS2M_CLK) == LOW) {
-    if (ps2_mouse_packet(dx, dy, b)) {
+    uint8_t b0, b1, b2;
+    if (ps2_mouse_packet_raw(b0, b1, b2)) {
+      // Construir mousereg0 com clamp configurável, preservando a semântica do adbduino
+      // b0: bit0 L, bit1 R, bit2 M, bit4 X sign, bit5 Y sign
+      // b1: X move (2's complement), b2: Y move (2's complement)
+      int8_t dxs = (int8_t)((b0 & 0x10) ? (b1 | 0xFFFFFF00) : b1);
+      int8_t dys = (int8_t)((b0 & 0x20) ? (b2 | 0xFFFFFF00) : b2);
+      // Clamp a ±MOUSE_DELTA_CLAMP (6 bits)
+      if (dxs > MOUSE_DELTA_CLAMP) dxs = MOUSE_DELTA_CLAMP;
+      if (dxs < -MOUSE_DELTA_CLAMP) dxs = -MOUSE_DELTA_CLAMP;
+      if (dys > MOUSE_DELTA_CLAMP) dys = MOUSE_DELTA_CLAMP;
+      if (dys < -MOUSE_DELTA_CLAMP) dys = -MOUSE_DELTA_CLAMP;
+
+      uint8_t magX6 = (uint8_t)((dxs < 0 ? -dxs : dxs) & 0x3F);
+      uint8_t magY6 = (uint8_t)((dys < 0 ? -dys : dys) & 0x3F);
+
+      mousereg0 = 0x80; // base fixa
+      // Botão esquerdo com inversão configurável
+      bool leftPressed = PS2_B0_LEFT_ACTIVE_HIGH ? ((b0 & 0x01) != 0) : ((b0 & 0x01) == 0);
+      if (!leftPressed) mousereg0 |= 0x8000; // como no adbduino
+      // Y: sinal conforme padrão adbduino (flip versus PS/2), magnitude clamp
+      if (magY6) {
+        mousereg0 |= (~(b0) & 0x20) << 9; // preserva semântica de sinal do adbduino
+        mousereg0 |= (uint16_t)(magY6) << 8;
+      }
+      // X: sinal do PS/2 diretamente, magnitude clamp
+      if (magX6) {
+        mousereg0 |= (b0 & 0x10) << 2;
+        mousereg0 |= magX6;
+      }
+      mousepending = 1;
+      // Guardar estado simples para debug e possivel talk reg2 (opcional)
       noInterrupts();
-      mouse_dx += dx;
-      mouse_dy += dy;
-      mouse_buttons = b;
+      mouse_dx += dxs;
+      mouse_dy += dys;
+      mouse_buttons = ((b0 & 0x01)?0x04:0) | ((b0 & 0x04)?0x02:0) | ((b0 & 0x02)?0x01:0);
       interrupts();
 #ifdef SERIAL_LOG
-      Serial.print(F("[MSE] dx=")); Serial.print(dx); Serial.print(F(" dy=")); Serial.print(dy);
-      Serial.print(F(" btn=")); Serial.println(b, BIN);
+      Serial.print(F("[MSE] raw x=")); Serial.print((int)b1);
+      Serial.print(F(" y=")); Serial.print((int)b2);
+      Serial.print(F(" b0=")); Serial.println(b0, BIN);
 #endif
     }
   }
+}
+
+// ----------------------------- Envio PS/2 (host→device) -----------------------------
+// Implementação leve com pinMode/digitalWrite; suficiente para LEDs e comandos básicos.
+
+static bool ps2_host_write_byte(uint8_t clkPin, uint8_t datPin, uint8_t val) {
+  // 1) Inibir clock por >=100us para pedir envio
+  pinMode(clkPin, OUTPUT); digitalWrite(clkPin, LOW);
+  delayMicroseconds(150);
+  // 2) Levar data a LOW enquanto mantemos clock LOW
+  pinMode(datPin, OUTPUT); digitalWrite(datPin, LOW);
+  // 3) Libertar clock (device irá gerar clock)
+  pinMode(clkPin, INPUT_PULLUP);
+
+  // 4) Enviar 8 bits LSB-first em bordas de clock do device
+  uint8_t parity = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    // Espera clock LOW
+    uint32_t t0 = micros();
+    while (digitalRead(clkPin) == HIGH) { if ((micros()-t0) > 2000) return false; }
+    // Define bit em data
+    if (val & (1 << i)) { digitalWrite(datPin, HIGH); parity++; }
+    else                { digitalWrite(datPin, LOW); }
+    // Espera clock HIGH (fim do bit)
+    t0 = micros();
+    while (digitalRead(clkPin) == LOW) { if ((micros()-t0) > 2000) return false; }
+  }
+
+  // 5) Paridade (odd)
+  {
+    uint32_t t0 = micros();
+    while (digitalRead(clkPin) == HIGH) { if ((micros()-t0) > 2000) return false; }
+    if ((parity & 1) == 0) digitalWrite(datPin, HIGH); else digitalWrite(datPin, LOW);
+    t0 = micros();
+    while (digitalRead(clkPin) == LOW) { if ((micros()-t0) > 2000) return false; }
+  }
+
+  // 6) Stop bit: libertar DATA
+  pinMode(datPin, INPUT_PULLUP);
+  // Device deverá gerar um ACK (linha data LOW) na próxima janela
+  // Espera opcional por ACK
+  uint32_t t0 = micros();
+  while (digitalRead(clkPin) == HIGH) { if ((micros()-t0) > 2000) break; }
+  // ACK é lido quando data=LOW durante um ciclo; não validamos estritamente aqui.
+
+  // 7) Fim
+  return true;
+}
+
+static void ps2_keyboard_send(uint8_t b) {
+  ps2_host_write_byte(PS2K_CLK, PS2K_DAT, b);
+}
+
+static void ps2_keyboard_set_leds_from_adb(uint8_t adb_leds) {
+  // ADB talk reg2 no adbduino envia invertido, LEDs ON quando bit=0.
+  // Converter para PS/2 0xED: bits: 0=Scroll, 1=Num, 2=Caps (1=ON)
+  uint8_t ps2 = 0;
+  // Heurística: se bit for 0 em ADB, LED ON
+  if ((adb_leds & 0x04) == 0) ps2 |= 0x01; // Scroll
+  if ((adb_leds & 0x01) == 0) ps2 |= 0x02; // Num
+  if ((adb_leds & 0x02) == 0) ps2 |= 0x04; // Caps
+  // Sequência: 0xED, depois máscara LEDs
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    ps2_keyboard_send(0xED);
+    bool ok = true;
+#if PS2_REQUIRE_ACK
+    // Esperar ACK (0xFA)
+    uint8_t ack;
+    uint32_t t0 = millis();
+    while (!ps2_read_byte(PS2K_CLK, PS2K_DAT, ack)) { if (millis() - t0 > 10) { ok = false; break; } }
+    if (ok && ack != 0xFA) ok = false;
+#endif
+    if (!ok) continue; // retry
+    ps2_keyboard_send(ps2);
+#if PS2_REQUIRE_ACK
+    ok = true; t0 = millis();
+    while (!ps2_read_byte(PS2K_CLK, PS2K_DAT, ack)) { if (millis() - t0 > 10) { ok = false; break; } }
+    if (ok && ack != 0xFA) ok = false;
+    if (!ok) continue; // retry de toda a sequência
+#endif
+    break; // sucesso ou ignore ACK
+  }
+}
+
+// Setup de rato PS/2 (reset, sample rate, resolution, scaling, enable)
+static void ps2_mouse_setup_if_enabled() {
+#if PS2M_SETUP_ENABLE
+  auto sendM = [](uint8_t b){ ps2_host_write_byte(PS2M_CLK, PS2M_DAT, b); };
+  auto waitAck = []() -> bool {
+#if PS2_REQUIRE_ACK
+    uint8_t ack;
+    uint32_t t0 = millis();
+    while (!ps2_read_byte(PS2M_CLK, PS2M_DAT, ack)) { if (millis() - t0 > 20) return false; }
+    return ack == 0xFA;
+#else
+    return true;
+#endif
+  };
+
+  // Reset
+  #if SERIAL_LOG
+    Serial.println(F("[PS2M] Reset"));
+  #endif
+  sendM(0xFF); (void)waitAck();
+  // Após reset, o rato pode enviar 0xAA e ID: ignoramos por simplicidade
+  // Sample rate
+  #if SERIAL_LOG
+    Serial.print(F("[PS2M] SampleRate=")); Serial.println(PS2M_SAMPLE_RATE, HEX);
+  #endif
+  sendM(0xF3); (void)waitAck();
+  sendM(PS2M_SAMPLE_RATE); (void)waitAck();
+  // Resolution
+  #if SERIAL_LOG
+    Serial.print(F("[PS2M] Resolution=")); Serial.println(PS2M_RESOLUTION, HEX);
+  #endif
+  sendM(0xE8); (void)waitAck();
+  sendM(PS2M_RESOLUTION); (void)waitAck();
+  // Scaling 1:1
+  #if SERIAL_LOG
+    Serial.println(F("[PS2M] Scaling 1:1"));
+  #endif
+  sendM(0xE6); (void)waitAck();
+  // Enable
+  #if SERIAL_LOG
+    Serial.println(F("[PS2M] Enable"));
+  #endif
+  sendM(0xF4); (void)waitAck();
+#endif
 }
 
 // ----------------------------- Resposta ADB aos “Talk/Listen” -----------------------------
 // Comandos ADB: cmd = (addr<<4) | (op<<2) | reg, onde op: 0=Talk, 1=Listen, 2=Flush, 3=Reserved
 // O host envia header e opcionalmente dados (Listen). Para simplificar, fazemos parsing leve.
 
-uint8_t adb_read_command_byte() {
-  return adb_read_byte_blocking();
+// Nota: Removemos o serviço ADB antigo e vamos usar a recepção/envio fiáveis como em adbduino no loop principal
+// Helpers de inibição PS/2 (coordenar janelas ADB)
+static inline void ps2_inhibit_all() {
+  // Teclado
+  pinMode(PS2K_CLK, OUTPUT); digitalWrite(PS2K_CLK, LOW);
+  // Rato
+  pinMode(PS2M_CLK, OUTPUT); digitalWrite(PS2M_CLK, LOW);
 }
-
-void adb_reply_keyboard_reg0() {
-  // ADB teclado reg0 devolve transições de teclas: 2 bytes por evento.
-  // Implementação simplificada: se houver evento na FIFO, devolvemos 2 bytes com up/down + código; senão 0xFF 0xFF.
-  uint8_t resp[2] = {0xFF, 0xFF};
-  noInterrupts();
-  if (kbd_head != kbd_tail) {
-    uint8_t ev = kbd_fifo[kbd_tail]; kbd_tail = (kbd_tail + 1) & 7;
-    bool up = (ev & 0x80) != 0;
-    uint8_t code = ev & 0x7F;
-    // Bits de reg0: [bit15 status primeiro; bits14..8 raw code; bit7 status segundo; bits6..0 segundo raw]
-    // Para um único evento, colocamos no “primeiro”:
-    resp[0] = (up ? 0x80 : 0x00) | (code >> 1);
-    resp[1] = (uint8_t)((code & 0x01) << 7) | 0x7F; // “segundo” vazio
-  }
-  interrupts();
-  adb_write_packet(resp, 2);
-}
-
-void adb_listen_keyboard_reg2(uint8_t data) {
-  // LEDs: bits 0..2; guardamos e ignoramos visualmente
-  kbd_leds = data & 0x07;
-#ifdef SERIAL_LOG
-  Serial.print(F("[ADB] KBD LEDs=")); Serial.println(kbd_leds, BIN);
-#endif
-}
-
-void adb_reply_mouse_reg0() {
-  // Rato handler 1/2: 2 bytes: [b xxx xxxx] [b yyy yyyy]; b=bit7=1 quando botão correspondente pressionado
-  int16_t dx; int16_t dy; uint8_t b;
-  noInterrupts();
-  dx = mouse_dx; dy = mouse_dy; b = mouse_buttons;
-  // Limita a -127..+127 e consome
-  if (dx > 127) dx = 127; if (dx < -127) dx = -127;
-  if (dy > 127) dy = 127; if (dy < -127) dy = -127;
-  mouse_dx -= dx; mouse_dy -= dy;
-  interrupts();
-
-  uint8_t x = (uint8_t)(dx & 0x7F);
-  uint8_t y = (uint8_t)(dy & 0x7F);
-  uint8_t b1 = ((b & 0x04) ? 0x80 : 0x00) | x; // left no bit7 + X
-  uint8_t b2 = ((b & 0x02) ? 0x80 : 0x00) | y; // middle no bit7 + Y
-  // Nota: botão direito só aparece em formato extendido (3º byte). Mantemos protocolo simples a 2 bytes, botões left/mid.
-  // Quem quiser mapear right→middle pode fazê-lo ajustando mouse_buttons.
-  uint8_t pkt[2] = { b1, b2 };
-  adb_write_packet(pkt, 2);
-}
-
-// Loop de atendimento ADB: espera ATTENTION, lê comando, responde se o endereço/reg nos diz respeito
-void adb_service_loop_once() {
-  if (!adb_wait_attention(2)) return; // nada novo
-
-  uint8_t cmd = adb_read_command_byte();
-  uint8_t addr = (cmd >> 4) & 0x0F;
-  uint8_t op   = (cmd >> 2) & 0x03;
-  uint8_t reg  = cmd & 0x03;
-
-#ifdef SERIAL_LOG
-  Serial.print(F("[ADB] cmd=")); Serial.print(cmd, HEX);
-  Serial.print(F(" addr=")); Serial.print(addr);
-  Serial.print(F(" op=")); Serial.print(op);
-  Serial.print(F(" reg=")); Serial.println(reg);
-#endif
-
-  if (addr == ADB_ADDR_KBD) {
-    if (op == 0 /*Talk*/) {
-      if (reg == 0) adb_reply_keyboard_reg0();
-      else {
-        // Outras regs: devolve 0xFF
-        uint8_t ff = 0xFF; adb_write_packet(&ff, 1);
-      }
-    } else if (op == 1 /*Listen*/) {
-      // Lê um byte de dados
-      uint8_t d = adb_read_byte_blocking();
-      if (reg == 2) adb_listen_keyboard_reg2(d);
-      // ACK vazio
-    } else if (op == 2 /*Flush*/) {
-      noInterrupts(); kbd_head = kbd_tail = 0; interrupts();
-    }
-  } else if (addr == ADB_ADDR_MSE) {
-    if (op == 0 /*Talk*/) {
-      if (reg == 0) adb_reply_mouse_reg0();
-      else {
-        uint8_t ff = 0xFF; adb_write_packet(&ff, 1);
-      }
-    } else if (op == 2 /*Flush*/) {
-      noInterrupts(); mouse_dx = mouse_dy = 0; interrupts();
-    }
-  } else {
-    // Não somos este device: ficar calado
-  }
+static inline void ps2_release_all() {
+  pinMode(PS2K_CLK, INPUT_PULLUP);
+  pinMode(PS2M_CLK, INPUT_PULLUP);
 }
 
 // ----------------------------- Setup e Loop -----------------------------
@@ -464,12 +591,17 @@ void setup() {
   pinMode(PS2K_DAT, INPUT_PULLUP);
   pinMode(PS2M_CLK, INPUT_PULLUP);
   pinMode(PS2M_DAT, INPUT_PULLUP);
-  pinMode(ADB_PIN, INPUT_PULLUP); // libertado; pull-up externo
+  // Linha ADB como entrada (libertada)
+  ADB_DDR &= ~(1 << ADB_DATA_BIT);
   pinMode(LED_PIN, OUTPUT);
 #ifdef SERIAL_LOG
   Serial.begin(115200);
   Serial.println(F("PS/2→ADB inicializado"));
 #endif
+  // Setup do rato PS/2 (opcional)
+  ps2_inhibit_all();
+  ps2_mouse_setup_if_enabled();
+  ps2_release_all();
 }
 
 void loop() {
@@ -477,8 +609,136 @@ void loop() {
   poll_ps2_keyboard();
   poll_ps2_mouse();
 
-  // 2) Servir ADB quando o host chamar
-  adb_service_loop_once();
+  // Preparar eventos de teclado para ADB, seguindo estilo do adbduino
+  if (!kbdpending) {
+    noInterrupts();
+    bool has = (kbd_head != kbd_tail);
+    uint8_t ev = 0;
+    if (has) { ev = kbd_fifo[kbd_tail]; kbd_tail = (kbd_tail + 1) & 7; }
+    interrupts();
+    if (has) {
+      uint8_t maccode = ev & 0x7F;
+      bool key_up = (ev & 0x80) != 0;
+      if (key_up) maccode |= 0x80;
+      if (maccode == 0xFF) {
+        kbdskip = 1;
+      } else {
+        kbdprev0 = maccode;
+      }
+      kbdreg0 = ((uint16_t)maccode << 8) | 0xFF;
+      kbdpending = 1;
+    }
+  }
+
+  // 2) ADB: se temos dados pendentes, escutar comando do host e responder
+  uint8_t cmd = 0;
+  if (mousepending || kbdpending) {
+    cmd = adb_recv_cmd(mousesrq | kbdsrq);
+  }
+
+  // Rato no endereço 3
+  if (((cmd >> 4) & 0x0F) == ADB_ADDR_MSE) {
+    switch (cmd & 0x0F) {
+      case 0xC: // talk register 0
+        if (mousepending) {
+          ps2_inhibit_all();
+          _delay_us(180);
+          ADB_DDR |= 1 << ADB_DATA_BIT; // saída
+          place_bit1(); // start bit
+          uint8_t mouse_b0 = (mousereg0 >> 8) & 0xFF;
+          uint8_t mouse_b1 = mousereg0 & 0xFF;
+          send_byte(mouse_b0);
+          send_byte(mouse_b1);
+#if ADB_MOUSE_HANDLER == 4
+          // Stub Handler 4: adicionar 3º byte com botão direito no bit7 (resto 0)
+          uint8_t mouse_b2 = (mouse_buttons & 0x01) ? 0x80 : 0x00; // right -> bit7
+          send_byte(mouse_b2);
+#endif
+          place_bit0(); // stop bit
+          ADB_DDR &= ~(1 << ADB_DATA_BIT); // liberta
+          mousepending = 0;
+          mousesrq = 0;
+          ps2_release_all();
+        }
+        break;
+      default:
+        // ignorar
+        break;
+    }
+  } else {
+    if (mousepending) mousesrq = 1; // pedir serviço
+  }
+
+  // Teclado no endereço 2
+  if (((cmd >> 4) & 0x0F) == ADB_ADDR_KBD) {
+    switch (cmd & 0x0F) {
+      case 0xC: // talk register 0
+        if (kbdpending) {
+          if (kbdskip) {
+            kbdskip = 0;
+            // envia keyup do anterior para evitar stuck
+            kbdprev0 |= 0x80;
+            kbdreg0 = (kbdprev0 << 8) | 0xFF;
+            kbskiptimer = millis();
+          } else if (millis() - kbskiptimer < 90) {
+            kbdpending = 0;
+            break;
+          }
+
+          kbdsrq = 0;
+          ps2_inhibit_all();
+          _delay_us(180);
+          ADB_DDR |= 1 << ADB_DATA_BIT; // saída
+          place_bit1();
+          send_byte((kbdreg0 >> 8) & 0xFF);
+          send_byte(kbdreg0 & 0xFF);
+          place_bit0();
+          ADB_DDR &= ~(1 << ADB_DATA_BIT);
+          kbdpending = 0;
+          ps2_release_all();
+        }
+        break;
+      case 0xA: { // listen register 2 (host → LEDs)
+        uint8_t d;
+        if (adb_recv_data_byte(d)) {
+          ps2_inhibit_all();
+          // refletir no teclado PS/2
+          ps2_keyboard_set_leds_from_adb(d);
+#ifdef SERIAL_LOG
+          Serial.print(F("[ADB] KBD Listen Reg2 d=")); Serial.println(d, HEX);
+#endif
+          ps2_release_all();
+        }
+        break;
+      }
+      case 0xE: { // talk register 2 (modifiers/leds)
+        // Construir adbleds de forma simples (tudo apagado=1 em ADB clássico invertido)
+        uint8_t adbleds = 0xFF;
+        // Sem estado de LEDs real, mantemos 0xFF
+        ps2_inhibit_all();
+        _delay_us(180);
+        ADB_DDR |= 1 << ADB_DATA_BIT;
+        place_bit1();
+        // modifierkeys: vamos sintetizar a partir dos flags
+        uint8_t mods = 0xFF;
+        // Bits limpados quando ativos (como em adbduino)
+        if (mod_cmd)    mods &= ~(1);
+        if (mod_alt)    mods &= ~(2);
+        if (mod_shift)  mods &= ~(4);
+        if (mod_ctrl)   mods &= ~(8);
+        send_byte(mods);
+        send_byte(adbleds);
+        place_bit0();
+        ADB_DDR &= ~(1 << ADB_DATA_BIT);
+        ps2_release_all();
+        break;
+      }
+      default:
+        break;
+    }
+  } else {
+    if (kbdpending) kbdsrq = 1;
+  }
 
   // 3) Indicador LED simples
   static uint32_t lastBlink = 0;
